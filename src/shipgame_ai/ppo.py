@@ -202,7 +202,6 @@ class PPOTrainer:
             {
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
-                "config": self.config,
                 "total_steps": self.total_steps,
             },
             path,
