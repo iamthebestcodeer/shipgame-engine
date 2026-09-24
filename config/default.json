@@ -1,0 +1,9 @@
+{
+  "world_radius": 480.0,
+  "dt": 0.1,
+  "max_steps": 3000,
+  "contact_slots": 16,
+  "terrain_rays": 16,
+  "crate_count": 24,
+  "bot_count": 5
+}

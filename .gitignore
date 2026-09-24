@@ -1,0 +1,10 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.testmondata
+__pycache__/
+*.py[cod]
+checkpoints/
+.coverage
+htmlcov/
