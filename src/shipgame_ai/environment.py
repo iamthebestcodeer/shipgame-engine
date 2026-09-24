@@ -15,7 +15,13 @@ from .domain import (
     Projectile,
 )
 from .observation import Observation, StepResult, observation_dimension
-from .physics import Transform, Velocity, sat_collision, terrain_collision
+from .physics import (
+    Transform,
+    Velocity,
+    boat_turn_rate,
+    sat_collision,
+    terrain_collision,
+)
 
 TURN_ACTIONS = 9
 THROTTLE_ACTIONS = 5
@@ -239,7 +245,8 @@ class NavalEnv:
             velocity=Velocity.from_mps(entity.speed),
         )
         transform.apply_guidance(
-            direction_target=entity.heading + turn * math.pi,
+            direction_target=entity.heading
+            + turn * boat_turn_rate(entity.length) * self.config.dt,
             velocity_target=spec.speed * throttle,
             max_speed=spec.speed,
             dt=self.config.dt,
@@ -739,9 +746,8 @@ class NavalEnv:
         difference = math.atan2(
             math.sin(desired - current), math.cos(desired - current)
         )
-        return float(
-            np.clip(difference / (entity.turn_rate * self.config.dt + 1e-6), -1.0, 1.0)
-        )
+        max_turn = boat_turn_rate(entity.length) * self.config.dt
+        return float(np.clip(difference / max_turn, -1.0, 1.0))
 
     def _clamp_to_world(self, entity: Entity) -> None:
         distance = math.hypot(entity.x, entity.y)

@@ -173,7 +173,7 @@ def radius_collision(
     sweep = speed * dt
     other_sweep = other_speed * dt
     distance_squared = (x - other_x) ** 2 + (y - other_y) ** 2
-    combined_radius = radius + other_radius + sweep + other_sweep
+    combined_radius = radius + other_radius + abs(sweep) + abs(other_sweep)
     return distance_squared <= combined_radius**2
 
 
@@ -263,7 +263,7 @@ def sat_collision(
     sweep = speed * dt
     other_sweep = other_speed * dt
     distance_squared = (x - other_x) ** 2 + (y - other_y) ** 2
-    combined_radius = radius + other_radius + sweep + other_sweep
+    combined_radius = radius + other_radius + abs(sweep) + abs(other_sweep)
     if distance_squared > combined_radius**2:
         return False
     axis_x = math.cos(direction)
@@ -274,9 +274,9 @@ def sat_collision(
     y += axis_y * sweep * 0.5
     other_x += other_axis_x * other_sweep * 0.5
     other_y += other_axis_y * other_sweep * 0.5
-    half_length = (length + sweep) * 0.5
+    half_length = (length + abs(sweep)) * 0.5
     half_width = width * 0.5
-    other_half_length = (other_length + other_sweep) * 0.5
+    other_half_length = (other_length + abs(other_sweep)) * 0.5
     other_half_width = other_width * 0.5
     return _sat_collision_half(
         x,
@@ -324,7 +324,7 @@ def terrain_collision(
     tangent_y = axis_x
     center_x = x + axis_x * sweep * 0.5
     center_y = y + axis_y * sweep * 0.5
-    half_length = max(0.0, (length + sweep) * 0.5 * 0.9)
+    half_length = (length + abs(sweep)) * 0.5 * 0.9
     half_width = width * 0.5 * 0.9
     collision_positions: list[tuple[float, float]] = []
     for terrain_x, terrain_y, radius in terrain:

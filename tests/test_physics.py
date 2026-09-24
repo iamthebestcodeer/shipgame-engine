@@ -30,16 +30,16 @@ def test_throttle_affects_movement() -> None:
 def test_reverse_speed_is_bounded() -> None:
     transform = Transform(x=0.0, y=0.0, direction=0.0)
 
-    transform.apply_guidance(
-        direction_target=0.0,
-        velocity_target=-20.0,
-        max_speed=20.0,
-        dt=0.1,
-        length=30.0,
-    )
+    for _ in range(100):
+        transform.apply_guidance(
+            direction_target=0.0,
+            velocity_target=-20.0,
+            max_speed=20.0,
+            dt=0.1,
+            length=30.0,
+        )
 
-    assert transform.velocity.speed >= -20.0 / 3.0 - 1.0 / 32.0
-    assert transform.velocity.speed <= 20.0 / 3.0 + 1.0 / 32.0
+    assert transform.velocity == Velocity.from_mps(-20.0 / 3.0)
 
 
 def test_velocity_and_altitude_are_quantized() -> None:
