@@ -306,30 +306,51 @@ class NavalEnv:
             if projectile.lifetime <= 0.0:
                 del self.projectiles[projectile.identifier]
                 continue
-            for target in list(self.entities.values()):
-                if target.kind is not EntityKind.SHIP or not target.alive:
-                    continue
-                if target.faction == projectile.faction:
-                    continue
-                if projectile.kind == "shell" and target.submerged:
-                    continue
-                if (
-                    math.hypot(target.x - projectile.x, target.y - projectile.y)
-                    > target.radius + projectile.radius
-                ):
-                    continue
-                self._damage(target, projectile.damage)
-                if projectile.faction is Faction.PLAYER:
-                    reward += projectile.damage * 0.05
-                    self.last_events.append("damage")
-                if target.health <= 0.0:
-                    target.alive = False
-                    if projectile.faction is Faction.PLAYER:
-                        self.score += 100
-                        reward += 10.0
-                        self.last_events.append("kill")
-                del self.projectiles[projectile.identifier]
-                break
+            target = self._projectile_target(projectile)
+            if target is None:
+                continue
+            reward += self._apply_projectile_hit(projectile, target)
+            del self.projectiles[projectile.identifier]
+        return reward
+
+    def _projectile_target(self, projectile: Projectile) -> Entity | None:
+        for target in self.entities.values():
+            if not self._can_hit_projectile(projectile, target):
+                continue
+            if self._projectile_intersects(projectile, target):
+                return target
+        return None
+
+    def _can_hit_projectile(self, projectile: Projectile, target: Entity) -> bool:
+        return (
+            target.kind is EntityKind.SHIP
+            and target.alive
+            and target.faction is not projectile.faction
+            and not (projectile.kind == "shell" and target.submerged)
+        )
+
+    def _projectile_intersects(
+        self, projectile: Projectile, target: Entity
+    ) -> bool:
+        return (
+            math.hypot(target.x - projectile.x, target.y - projectile.y)
+            <= target.radius + projectile.radius
+        )
+
+    def _apply_projectile_hit(
+        self, projectile: Projectile, target: Entity
+    ) -> float:
+        self._damage(target, projectile.damage)
+        if projectile.faction is not Faction.PLAYER:
+            return 0.0
+        reward = projectile.damage * 0.05
+        self.last_events.append("damage")
+        if target.health > 0.0:
+            return reward
+        target.alive = False
+        self.score += 100
+        reward += 10.0
+        self.last_events.append("kill")
         return reward
 
     def _resolve_crates(self) -> float:
@@ -357,64 +378,73 @@ class NavalEnv:
         ]
         for index, first in enumerate(ships):
             for second in ships[index + 1 :]:
-                if not sat_collision(
-                    first.x,
-                    first.y,
-                    first.heading,
-                    first.speed,
-                    first.length,
-                    first.radius,
-                    first.radius,
-                    second.x,
-                    second.y,
-                    second.heading,
-                    second.speed,
-                    second.length,
-                    second.radius,
-                    second.radius,
-                    self.config.dt,
-                ):
+                if not self._ship_pair_collides(first, second):
                     continue
-                for boat, other in ((first, second), (second, first)):
-                    front_x = other.x + math.cos(other.heading) * other.length * 0.5
-                    front_y = other.y + math.sin(other.heading) * other.length * 0.5
-                    front_distance_squared = (boat.x - front_x) ** 2 + (
-                        boat.y - front_y
-                    ) ** 2
-                    if boat.faction is not other.faction:
-                        base_damage = min(
-                            boat.max_health - boat.health * 0.5,
-                            other.max_health - other.health * 0.5,
-                        ) * self.config.dt / 10.0
-                        multiplier = self._collision_multiplier(
-                            front_distance_squared, boat.radius**2, boat.ship_key
-                        )
-                        if boat.ship_key == "submarine":
-                            multiplier *= 1.5
-                        elif boat.submerged:
-                            multiplier *= 10.0
-                        self._damage(boat, base_damage * multiplier)
-                    relative_mass = other.length * other.radius / (
-                        boat.length * boat.radius
-                    )
-                    if boat.faction is other.faction:
-                        relative_mass *= 3.0
-                    closest_x, closest_y = self._closest_point_on_keel(other, boat)
-                    difference_x = boat.x - closest_x
-                    difference_y = boat.y - closest_y
-                    difference_length = math.hypot(difference_x, difference_y)
-                    if difference_length > 0.0:
-                        difference_x /= difference_length
-                        difference_y /= difference_length
-                    impulse = 2.0 * (
-                        difference_x * math.cos(boat.heading)
-                        + difference_y * math.sin(boat.heading)
-                    ) * relative_mass
-                    self._set_motion(boat, max(-15.0, min(15.0, boat.speed + impulse)))
-                if first.faction is Faction.PLAYER or second.faction is Faction.PLAYER:
-                    reward -= 2.0
-                    self.last_events.append("collision")
+                reward += self._apply_ship_pair_collision(first, second)
         return reward
+
+    def _ship_pair_collides(self, first: Entity, second: Entity) -> bool:
+        return sat_collision(
+            first.x,
+            first.y,
+            first.heading,
+            first.speed,
+            first.length,
+            first.radius,
+            first.radius,
+            second.x,
+            second.y,
+            second.heading,
+            second.speed,
+            second.length,
+            second.radius,
+            second.radius,
+            self.config.dt,
+        )
+
+    def _apply_ship_pair_collision(self, first: Entity, second: Entity) -> float:
+        self._apply_boat_collision(first, second)
+        self._apply_boat_collision(second, first)
+        if first.faction is Faction.PLAYER or second.faction is Faction.PLAYER:
+            self.last_events.append("collision")
+            return -2.0
+        return 0.0
+
+    def _apply_boat_collision(self, boat: Entity, other: Entity) -> None:
+        if boat.faction is not other.faction:
+            front_x = other.x + math.cos(other.heading) * other.length * 0.5
+            front_y = other.y + math.sin(other.heading) * other.length * 0.5
+            front_distance_squared = (boat.x - front_x) ** 2 + (boat.y - front_y) ** 2
+            base_damage = min(
+                boat.max_health - boat.health * 0.5,
+                other.max_health - other.health * 0.5,
+            ) * self.config.dt / 10.0
+            multiplier = self._collision_multiplier(
+                front_distance_squared, boat.radius**2, boat.ship_key
+            )
+            if boat.ship_key == "submarine":
+                multiplier *= 1.5
+            elif boat.submerged:
+                multiplier *= 10.0
+            self._damage(boat, base_damage * multiplier)
+        self._apply_collision_impulse(boat, other)
+
+    def _apply_collision_impulse(self, boat: Entity, other: Entity) -> None:
+        relative_mass = other.length * other.radius / (boat.length * boat.radius)
+        if boat.faction is other.faction:
+            relative_mass *= 3.0
+        closest_x, closest_y = self._closest_point_on_keel(other, boat)
+        difference_x = boat.x - closest_x
+        difference_y = boat.y - closest_y
+        difference_length = math.hypot(difference_x, difference_y)
+        if difference_length > 0.0:
+            difference_x /= difference_length
+            difference_y /= difference_length
+        impulse = 2.0 * (
+            difference_x * math.cos(boat.heading)
+            + difference_y * math.sin(boat.heading)
+        ) * relative_mass
+        self._set_motion(boat, max(-15.0, min(15.0, boat.speed + impulse)))
 
     def _closest_point_on_keel(
         self, boat: Entity, position: Entity
