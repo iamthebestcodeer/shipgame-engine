@@ -32,6 +32,7 @@ class ShipSpec:
     depth: float
     weapons: tuple[WeaponSpec, ...]
     upgrade: str | None = None
+    length: float = 0.0
 
 
 SHIPS: dict[str, ShipSpec] = {
@@ -51,6 +52,7 @@ SHIPS: dict[str, ShipSpec] = {
             WeaponSpec("torpedo", "torpedo", 48.0, 18.0, 3.0, 5.0, 2.0, True),
         ),
         upgrade="destroyer",
+        length=30.0,
     ),
     "destroyer": ShipSpec(
         name="Destroyer",
@@ -68,6 +70,7 @@ SHIPS: dict[str, ShipSpec] = {
             WeaponSpec("torpedo", "torpedo", 50.0, 24.0, 3.0, 5.0, 2.2, True),
         ),
         upgrade="battleship",
+        length=44.0,
     ),
     "battleship": ShipSpec(
         name="Battleship",
@@ -84,6 +87,7 @@ SHIPS: dict[str, ShipSpec] = {
             WeaponSpec("shell", "shell", 115.0, 28.0, 3.5, 3.5, 1.2, False),
             WeaponSpec("torpedo", "torpedo", 48.0, 30.0, 3.5, 5.0, 2.8, True),
         ),
+        length=68.0,
     ),
     "submarine": ShipSpec(
         name="Submarine",
@@ -101,6 +105,7 @@ SHIPS: dict[str, ShipSpec] = {
             WeaponSpec("shell", "shell", 95.0, 8.0, 2.0, 3.0, 1.0, True),
         ),
         upgrade="destroyer",
+        length=34.0,
     ),
 }
 

@@ -8,3 +8,8 @@ __pycache__/
 checkpoints/
 .coverage
 htmlcov/
+*.log
+*.png
+*.egg-info/
+build/
+dist/

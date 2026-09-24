@@ -7,8 +7,21 @@ from typing import ClassVar
 import numpy as np
 
 from .config import SHIPS, GameConfig, WeaponSpec
-from .domain import Entity, EntityKind, Faction, Projectile
+from .domain import (
+    SPAWN_PROTECTION_INITIAL,
+    Entity,
+    EntityKind,
+    Faction,
+    Projectile,
+)
 from .observation import Observation, StepResult, observation_dimension
+from .physics import (
+    Transform,
+    Velocity,
+    boat_turn_rate,
+    sat_collision,
+    terrain_collision,
+)
 
 TURN_ACTIONS = 9
 THROTTLE_ACTIONS = 5
@@ -40,6 +53,8 @@ class NavalEnv:
         self.next_identifier = 1
         self.dead = False
         self.last_events: list[str] = []
+        self._blocked_from_repair: set[int] = set()
+        self._outside_border: set[int] = set()
 
     def reset(self, seed: int | None = None) -> Observation:
         if seed is not None:
@@ -52,6 +67,8 @@ class NavalEnv:
         self.next_identifier = 1_000_000
         self.dead = False
         self.last_events = []
+        self._blocked_from_repair = set()
+        self._outside_border = set()
         self.terrain = self._create_terrain()
         self._create_ships()
         self._create_crates()
@@ -63,25 +80,32 @@ class NavalEnv:
         if self.dead:
             raise RuntimeError("reset the environment before stepping a dead episode")
         self.last_events = []
-        self._advance_reloads()
         decoded = self._decode(action)
         self._control_player(decoded)
         for entity in self._bot_entities():
             self._control_bot(entity)
+        self._outside_border.clear()
         for entity in list(self.entities.values()):
             if entity.alive and entity.kind is EntityKind.SHIP:
                 self._drive(
                     entity,
                     decoded.turn if entity.identifier == 0 else self._bot_steer(entity),
-                    0.8,
+                    decoded.throttle if entity.identifier == 0 else 0.8,
                 )
+        self._blocked_from_repair.clear()
         reward = 0.01
         for projectile in self.projectiles.values():
             self._move_projectile(projectile)
         reward += self._resolve_projectiles()
         reward += self._resolve_crates()
         reward += self._resolve_ship_collisions()
+        reward += self._resolve_boundaries()
         reward += self._resolve_terrain()
+        for entity in self.entities.values():
+            if entity.kind is EntityKind.SHIP and entity.alive and entity.health > 0.0:
+                entity.update_tickers()
+                entity.advance_reloads()
+        self._repair_ships()
         self._remove_dead_entities()
         self.step_count += 1
         self.elapsed += self.config.dt
@@ -124,15 +148,13 @@ class NavalEnv:
         self, identifier: int, ship_key: str, x: float, y: float, faction: Faction
     ) -> Entity:
         spec = SHIPS[ship_key]
-        reloads = {weapon.name: 0.0 for weapon in spec.weapons}
+        reloads = {weapon.name: 0 for weapon in spec.weapons}
         return Entity(
             identifier=identifier,
             kind=EntityKind.SHIP,
             name=spec.name,
             x=x,
             y=y,
-            vx=0.0,
-            vy=0.0,
             radius=spec.radius,
             health=spec.health,
             max_health=spec.health,
@@ -143,10 +165,16 @@ class NavalEnv:
             target_speed=spec.speed,
             turn_rate=spec.turn_rate,
             acceleration=spec.acceleration,
+            length=spec.length,
             draft=spec.draft,
             depth=spec.depth,
             weapons=tuple(weapon.name for weapon in spec.weapons),
             reloads=reloads,
+            active=True,
+            active_requested=True,
+            spawn_protection_remaining=(
+                SPAWN_PROTECTION_INITIAL if spec.level == 1 else 0
+            ),
         )
 
     def _create_crates(self) -> None:
@@ -160,8 +188,6 @@ class NavalEnv:
                 name="Crate",
                 x=distance * math.cos(angle),
                 y=distance * math.sin(angle),
-                vx=0.0,
-                vy=0.0,
                 radius=8.0,
                 health=1.0,
                 max_health=1.0,
@@ -183,18 +209,15 @@ class NavalEnv:
         if action.auxiliary in (1, 2):
             self._fire(self.player, action.auxiliary - 1)
         if action.auxiliary == 3:
-            self.player.submerged = not self.player.submerged
+            self.player.set_submerge(not self.player.submerge_requested)
         if action.auxiliary == 4:
-            self.player.active = not self.player.active
+            self.player.set_active(not self.player.active_requested)
         if action.auxiliary == 5:
             self._upgrade_player()
 
     def _advance_reloads(self) -> None:
         for entity in self.entities.values():
-            if entity.reloads is None:
-                continue
-            for name, cooldown in tuple(entity.reloads.items()):
-                entity.reloads[name] = max(0.0, cooldown - self.config.dt)
+            entity.advance_reloads()
 
     def _control_bot(self, entity: Entity) -> None:
         target = self._nearest_enemy(entity)
@@ -207,36 +230,40 @@ class NavalEnv:
             if ready:
                 self._fire(entity, entity.weapons.index(ready[0]))
         if entity.ship_key == "submarine" and entity.health < entity.max_health * 0.55:
-            entity.submerged = True
+            entity.set_submerge(True)
         else:
-            entity.submerged = False
+            entity.set_submerge(False)
 
     def _drive(self, entity: Entity, turn: float, throttle: float) -> None:
         if entity.ship_key is None:
             return
         spec = SHIPS[entity.ship_key]
-        if entity.speed_magnitude < 0.01:
-            entity.vx = spec.speed
-            entity.vy = 0.0
-        current = math.atan2(entity.vy, entity.vx)
-        target = current + turn * spec.turn_rate * self.config.dt
-        target_speed = spec.speed * throttle
-        entity.speed = float(
-            np.clip(
-                entity.speed
-                + np.sign(target_speed - entity.speed)
-                * min(
-                    spec.acceleration * self.config.dt, abs(target_speed - entity.speed)
-                ),
-                0.0,
-                spec.speed,
-            )
+        transform = Transform(
+            x=entity.x,
+            y=entity.y,
+            direction=entity.heading,
+            velocity=Velocity.from_mps(entity.speed),
         )
-        entity.vx = math.cos(target) * entity.speed
-        entity.vy = math.sin(target) * entity.speed
-        entity.x += entity.vx * self.config.dt
-        entity.y += entity.vy * self.config.dt
+        transform.apply_guidance(
+            direction_target=entity.heading
+            + turn * boat_turn_rate(entity.length) * self.config.dt,
+            velocity_target=spec.speed * throttle,
+            max_speed=spec.speed,
+            dt=self.config.dt,
+            length=entity.length,
+        )
+        transform.do_kinematics(self.config.dt)
+        entity.x = transform.x
+        entity.y = transform.y
+        entity.heading = transform.direction
+        self._set_motion(entity, transform.velocity.to_mps())
         self._clamp_to_world(entity)
+
+    def _set_motion(self, entity: Entity, speed: float) -> None:
+        velocity = Velocity.from_mps(speed)
+        entity.speed = velocity.to_mps()
+        entity.vx = math.cos(entity.heading) * entity.speed
+        entity.vy = math.sin(entity.heading) * entity.speed
 
     def _fire(self, entity: Entity, weapon_index: int) -> None:
         if weapon_index < 0 or weapon_index >= len(entity.weapons):
@@ -244,9 +271,9 @@ class NavalEnv:
         weapon = self._weapon_spec(entity, weapon_index)
         if weapon is None or entity.reloads is None:
             return
-        if entity.reloads.get(weapon.name, 0.0) > 0.0:
+        if entity.reloads.get(weapon.name, 0) > 0:
             return
-        if weapon.kind == "shell" and entity.submerged:
+        if not weapon.submerged and entity.submerged:
             return
         target = self._nearest_enemy(entity)
         if target is None:
@@ -270,7 +297,8 @@ class NavalEnv:
             faction=entity.faction,
             lifetime=weapon.lifetime,
         )
-        entity.reloads[weapon.name] = weapon.reload
+        entity.consume_reload(weapon.name, self._reload_ticks(weapon.reload))
+        entity.clear_spawn_protection()
 
     def _move_projectile(self, projectile: Projectile) -> None:
         projectile.x += projectile.vx * self.config.dt
@@ -285,30 +313,51 @@ class NavalEnv:
             if projectile.lifetime <= 0.0:
                 del self.projectiles[projectile.identifier]
                 continue
-            for target in list(self.entities.values()):
-                if target.kind is not EntityKind.SHIP or not target.alive:
-                    continue
-                if target.faction == projectile.faction:
-                    continue
-                if projectile.kind == "shell" and target.submerged:
-                    continue
-                if (
-                    math.hypot(target.x - projectile.x, target.y - projectile.y)
-                    > target.radius + projectile.radius
-                ):
-                    continue
-                target.health -= projectile.damage
-                if projectile.faction is Faction.PLAYER:
-                    reward += projectile.damage * 0.05
-                    self.last_events.append("damage")
-                if target.health <= 0.0:
-                    target.alive = False
-                    if projectile.faction is Faction.PLAYER:
-                        self.score += 100
-                        reward += 10.0
-                        self.last_events.append("kill")
-                del self.projectiles[projectile.identifier]
-                break
+            target = self._projectile_target(projectile)
+            if target is None:
+                continue
+            reward += self._apply_projectile_hit(projectile, target)
+            del self.projectiles[projectile.identifier]
+        return reward
+
+    def _projectile_target(self, projectile: Projectile) -> Entity | None:
+        for target in self.entities.values():
+            if not self._can_hit_projectile(projectile, target):
+                continue
+            if self._projectile_intersects(projectile, target):
+                return target
+        return None
+
+    def _can_hit_projectile(self, projectile: Projectile, target: Entity) -> bool:
+        return (
+            target.kind is EntityKind.SHIP
+            and target.alive
+            and target.faction is not projectile.faction
+            and not (projectile.kind == "shell" and target.submerged)
+        )
+
+    def _projectile_intersects(
+        self, projectile: Projectile, target: Entity
+    ) -> bool:
+        return (
+            math.hypot(target.x - projectile.x, target.y - projectile.y)
+            <= target.radius + projectile.radius
+        )
+
+    def _apply_projectile_hit(
+        self, projectile: Projectile, target: Entity
+    ) -> float:
+        self._damage(target, projectile.damage)
+        if projectile.faction is not Faction.PLAYER:
+            return 0.0
+        reward = projectile.damage * 0.05
+        self.last_events.append("damage")
+        if target.health > 0.0:
+            return reward
+        target.alive = False
+        self.score += 100
+        reward += 10.0
+        self.last_events.append("kill")
         return reward
 
     def _resolve_crates(self) -> float:
@@ -336,34 +385,145 @@ class NavalEnv:
         ]
         for index, first in enumerate(ships):
             for second in ships[index + 1 :]:
-                if (
-                    math.hypot(first.x - second.x, first.y - second.y)
-                    > first.radius + second.radius
-                ):
+                if not self._ship_pair_collides(first, second):
                     continue
-                first.health -= 10.0
-                second.health -= 10.0
-                if first.faction is Faction.PLAYER or second.faction is Faction.PLAYER:
-                    reward -= 2.0
-                    self.last_events.append("collision")
+                reward += self._apply_ship_pair_collision(first, second)
+        return reward
+
+    def _ship_pair_collides(self, first: Entity, second: Entity) -> bool:
+        return sat_collision(
+            first.x,
+            first.y,
+            first.heading,
+            first.speed,
+            first.length,
+            first.radius,
+            first.radius,
+            second.x,
+            second.y,
+            second.heading,
+            second.speed,
+            second.length,
+            second.radius,
+            second.radius,
+            self.config.dt,
+        )
+
+    def _apply_ship_pair_collision(self, first: Entity, second: Entity) -> float:
+        self._apply_boat_collision(first, second)
+        self._apply_boat_collision(second, first)
+        if first.faction is Faction.PLAYER or second.faction is Faction.PLAYER:
+            self.last_events.append("collision")
+            return -2.0
+        return 0.0
+
+    def _apply_boat_collision(self, boat: Entity, other: Entity) -> None:
+        if boat.faction is not other.faction:
+            front_x = other.x + math.cos(other.heading) * other.length * 0.5
+            front_y = other.y + math.sin(other.heading) * other.length * 0.5
+            front_distance_squared = (boat.x - front_x) ** 2 + (boat.y - front_y) ** 2
+            base_damage = min(
+                boat.max_health - boat.health * 0.5,
+                other.max_health - other.health * 0.5,
+            ) * self.config.dt / 10.0
+            multiplier = self._collision_multiplier(
+                front_distance_squared, boat.radius**2, boat.ship_key
+            )
+            if boat.ship_key == "submarine":
+                multiplier *= 1.5
+            elif boat.submerged:
+                multiplier *= 10.0
+            self._damage(boat, base_damage * multiplier)
+        self._apply_collision_impulse(boat, other)
+
+    def _apply_collision_impulse(self, boat: Entity, other: Entity) -> None:
+        relative_mass = other.length * other.radius / (boat.length * boat.radius)
+        if boat.faction is other.faction:
+            relative_mass *= 3.0
+        closest_x, closest_y = self._closest_point_on_keel(other, boat)
+        difference_x = boat.x - closest_x
+        difference_y = boat.y - closest_y
+        difference_length = math.hypot(difference_x, difference_y)
+        if difference_length > 0.0:
+            difference_x /= difference_length
+            difference_y /= difference_length
+        impulse = 2.0 * (
+            difference_x * math.cos(boat.heading)
+            + difference_y * math.sin(boat.heading)
+        ) * relative_mass
+        self._set_motion(boat, max(-15.0, min(15.0, boat.speed + impulse)))
+
+    def _closest_point_on_keel(
+        self, boat: Entity, position: Entity
+    ) -> tuple[float, float]:
+        difference_x = position.x - boat.x
+        difference_y = position.y - boat.y
+        if difference_x * difference_x + difference_y * difference_y < 1.0:
+            return boat.x, boat.y
+        along = difference_x * math.cos(boat.heading) + difference_y * math.sin(
+            boat.heading
+        )
+        along = max(-boat.length * 0.5, min(boat.length * 0.5, along))
+        return (
+            boat.x + math.cos(boat.heading) * along,
+            boat.y + math.sin(boat.heading) * along,
+        )
+
+    def _collision_multiplier(
+        self, distance_squared: float, radius_squared: float, ship_key: str | None
+    ) -> float:
+        minimum = 0.8 if ship_key == "submarine" else 0.6
+        multiplier = (
+            (radius_squared - distance_squared) / radius_squared * (1.0 - minimum)
+            + minimum
+        )
+        return max(minimum, min(1.0, multiplier))
+
+    def _resolve_boundaries(self) -> float:
+        reward = 0.0
+        for entity in self.entities.values():
+            if entity.kind is not EntityKind.SHIP or not entity.alive:
+                continue
+            if entity.identifier not in self._outside_border:
+                continue
+            if entity.faction is Faction.PLAYER:
+                reward -= 2.0
+            self.last_events.append("terrain")
+            self._blocked_from_repair.add(entity.identifier)
+            self._damage(entity, max(entity.max_health, 0.1) * self.config.dt)
         return reward
 
     def _resolve_terrain(self) -> float:
         reward = 0.0
         for entity in self.entities.values():
-            if (
-                entity.kind is not EntityKind.SHIP
-                or not entity.alive
-                or entity.submerged
-            ):
+            if entity.kind is not EntityKind.SHIP or not entity.alive:
                 continue
-            for x, y, radius in self.terrain:
-                if math.hypot(entity.x - x, entity.y - y) > entity.radius + radius:
-                    continue
-                if entity.faction is Faction.PLAYER:
-                    reward -= 2.0
-                self.last_events.append("terrain")
-                entity.health -= 8.0
+            collision = terrain_collision(
+                entity.x,
+                entity.y,
+                entity.heading,
+                entity.speed,
+                entity.length,
+                entity.radius,
+                self.terrain,
+                self.config.dt,
+            )
+            if collision is None:
+                continue
+            delta_x = (collision[0] - entity.x) / entity.length
+            delta_y = (collision[1] - entity.y) / entity.length
+            dot = math.cos(entity.heading) * delta_x + math.sin(
+                entity.heading
+            ) * delta_y
+            push = Velocity.from_mps(dot * -150.0)
+            speed = entity.speed + push.to_mps()
+            self._set_motion(entity, max(-5.0, min(5.0, speed)))
+            if entity.faction is Faction.PLAYER:
+                reward -= 2.0
+            self.last_events.append("terrain")
+            self._blocked_from_repair.add(entity.identifier)
+            damage = max(entity.max_health / 4.0, 0.1) * self.config.dt
+            self._damage(entity, damage)
         return reward
 
     def _upgrade_player(self) -> None:
@@ -381,12 +541,42 @@ class NavalEnv:
         player.max_health = spec.health
         player.health = spec.health
         player.speed = 0.0
+        player.vx = 0.0
+        player.vy = 0.0
         player.target_speed = spec.speed
         player.turn_rate = spec.turn_rate
         player.acceleration = spec.acceleration
+        player.length = spec.length
         player.weapons = tuple(weapon.name for weapon in spec.weapons)
-        player.reloads = {weapon.name: 0.0 for weapon in spec.weapons}
+        player.reloads = {weapon.name: 0 for weapon in spec.weapons}
+        player.spawn_protection_remaining = (
+            SPAWN_PROTECTION_INITIAL if spec.level == 1 else 0
+        )
         self.score -= 100
+
+    def _damage(self, entity: Entity, amount: float) -> None:
+        entity.health -= amount * entity.spawn_protection()
+
+    def _repair_eligible(self, entity: Entity) -> bool:
+        if entity.health <= 0.0:
+            return False
+        if math.hypot(entity.x, entity.y) > self.config.world_radius:
+            return False
+        return entity.identifier not in self._blocked_from_repair
+
+    def _repair_ships(self) -> None:
+        for entity in self.entities.values():
+            if entity.kind is not EntityKind.SHIP or not entity.alive:
+                continue
+            if not self._repair_eligible(entity):
+                continue
+            if entity.length > 200.0:
+                rate = 3.0
+            elif entity.length > 100.0:
+                rate = 2.0
+            else:
+                rate = 1.0
+            entity.repair(rate)
 
     def _remove_dead_entities(self) -> None:
         for entity in self.entities.values():
@@ -504,7 +694,7 @@ class NavalEnv:
             weapon = self._weapon_spec(player, weapon_index)
             if weapon is None:
                 return False
-            if weapon.kind == "shell" and player.submerged:
+            if not weapon.submerged and player.submerged:
                 return False
             return (player.reloads or {}).get(weapon.name, 0.0) <= 0.0
         if auxiliary == 3:
@@ -514,6 +704,9 @@ class NavalEnv:
             and SHIPS[player.ship_key].upgrade is not None
             and self.score >= 100
         )
+
+    def _reload_ticks(self, seconds: float) -> int:
+        return min(65535, max(0, math.trunc(seconds * 10.0)))
 
     def _weapon_spec(self, entity: Entity, index: int) -> WeaponSpec | None:
         if entity.ship_key is None or index >= len(entity.weapons):
@@ -549,23 +742,27 @@ class NavalEnv:
         if target is None:
             return 0.0
         desired = math.atan2(target.y - entity.y, target.x - entity.x)
-        current = (
-            math.atan2(entity.vy, entity.vx) if entity.speed_magnitude > 0.01 else 0.0
-        )
+        current = entity.heading
         difference = math.atan2(
             math.sin(desired - current), math.cos(desired - current)
         )
-        return float(
-            np.clip(difference / (entity.turn_rate * self.config.dt + 1e-6), -1.0, 1.0)
-        )
+        max_turn = boat_turn_rate(entity.length) * self.config.dt
+        return float(np.clip(difference / max_turn, -1.0, 1.0))
 
     def _clamp_to_world(self, entity: Entity) -> None:
         distance = math.hypot(entity.x, entity.y)
-        limit = self.config.world_radius - entity.radius
-        if distance > limit:
-            scale = limit / distance
-            entity.x *= scale
-            entity.y *= scale
+        if distance <= self.config.world_radius:
+            return
+        normal_x = -entity.x / distance
+        normal_y = -entity.y / distance
+        scale = self.config.world_radius / distance
+        entity.x *= scale
+        entity.y *= scale
+        self._outside_border.add(entity.identifier)
+        inward_speed = 10.0 * (
+            normal_x * math.cos(entity.heading) + normal_y * math.sin(entity.heading)
+        )
+        self._set_motion(entity, inward_speed)
 
     def _bot_entities(self) -> list[Entity]:
         return [
